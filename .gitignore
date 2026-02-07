@@ -1,0 +1,39 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated
+api/proto/gen/
+
+# Local config overrides
+configs/*.local.yaml
+
+# Logs
+*.log
+logs/
+
+# Docs - architecture discussion (internal only)
+docs/architecture-discussion.md

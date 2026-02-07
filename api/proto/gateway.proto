@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package imsys;
+
+option go_package = "github.com/qiminjie89/imsys/api/proto/gen";
+
+// Gateway 与 Roomserver 之间的双向流通信
+service RoomServerGateway {
+    // 双向流：Gateway 和 Roomserver 之间的长连接通道
+    rpc Channel(stream Envelope) returns (stream Envelope);
+}
+
+// 通用消息信封
+message Envelope {
+    uint32 msg_type = 1;   // 消息类型编号
+    bytes  payload  = 2;   // msgpack 序列化的业务数据
+    uint64 seq      = 3;   // 序列号（用于请求-响应匹配）
+}
+
+// Roomserver 之间的内部通信（用于请求转发）
+service RoomServerInternal {
+    // 转发推送请求（路由过时时使用）
+    rpc Forward(ForwardRequest) returns (ForwardResponse);
+}
+
+message ForwardRequest {
+    string request_type = 1;  // unicast, multicast, broadcast
+    bytes  payload      = 2;  // 原始请求数据
+}
+
+message ForwardResponse {
+    int32  code    = 1;
+    string message = 2;
+}

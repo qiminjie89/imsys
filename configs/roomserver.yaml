@@ -1,0 +1,41 @@
+# Roomserver 配置文件
+
+server:
+  id: "roomserver-1"
+  grpc_addr: ":9000"         # gRPC 监听地址（供 Gateway 连接）
+  http_addr: ":9001"         # HTTP 监听地址（供 Python 后端调用）
+
+# Room 配置
+room:
+  msg_ch_size: 1000          # 每房间广播队列大小
+  member_disconnect_timeout: 60s  # 用户断连保留时间
+
+# 恢复模式配置
+recovery:
+  timeout: 20s               # RECOVERY MODE 最长持续时间
+  push_queue_size: 10000     # 恢复期间推送缓冲队列大小
+  gateway_request_queue_size: 1000
+  resync_batch_size: 1000    # BatchReSync 每批用户数
+  resync_batch_interval: 10ms
+
+# 一致性哈希配置
+hashring:
+  virtual_nodes: 150         # 虚拟节点数
+
+# Nacos 配置
+nacos:
+  server_addr: "localhost:8848"
+  namespace: "imsys"
+  service_name: "imsys-roomserver"
+  gateway_service: "imsys-gateway"
+
+# 日志配置
+log:
+  level: "info"
+  format: "json"
+  output: "stdout"
+
+# 监控配置
+metrics:
+  enabled: true
+  addr: ":9090"

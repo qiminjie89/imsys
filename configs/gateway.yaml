@@ -1,0 +1,64 @@
+# Gateway 配置文件
+
+server:
+  id: "gateway-1"
+  addr: ":8080"              # WebSocket 监听地址
+  health_addr: ":8081"       # 健康检查端口
+
+websocket:
+  read_buffer_size: 4096
+  write_buffer_size: 4096
+  handshake_timeout: 10s
+
+# Distributor 配置
+distributor:
+  shards: 10                 # 分片数（建议 CPU 核数 × 2）
+  input_queue_size: 10000    # 每分片输入队列大小
+
+# 连接配置
+connection:
+  send_ch_size: 1024         # 每连接下行队列大小
+  batch_interval: 10ms       # 批量发送间隔
+  batch_max_size: 10         # 单批最大消息数
+  heartbeat_interval: 20s    # 心跳间隔
+
+# 连接保护
+protection:
+  queue_warning_ratio: 0.5   # 队列预警阈值（开始丢弃 Low）
+  queue_severe_ratio: 0.8    # 队列严重阈值（开始丢弃 Normal）
+  queue_critical_ratio: 0.95 # 队列危险阈值（开始丢弃 High）
+  queue_full_timeout: 30s    # 队列满持续时间阈值
+  max_consecutive_drops: 50  # 连续丢弃次数阈值
+  write_timeout: 500ms       # 单次写超时
+  max_consecutive_write_timeouts: 10
+
+# Roomserver 连接
+roomserver:
+  reconnect_interval: 1s
+  reconnect_max_interval: 30s
+
+# Kafka 配置
+kafka:
+  brokers:
+    - "localhost:9092"
+  topic: "im-business-requests"
+  batch_size: 100
+  batch_timeout: 10ms
+
+# Nacos 配置
+nacos:
+  server_addr: "localhost:8848"
+  namespace: "imsys"
+  service_name: "imsys-gateway"
+  roomserver_service: "imsys-roomserver"
+
+# 日志配置
+log:
+  level: "info"              # debug, info, warn, error
+  format: "json"             # json, console
+  output: "stdout"           # stdout, file path
+
+# 监控配置
+metrics:
+  enabled: true
+  addr: ":9090"              # Prometheus metrics 端口
