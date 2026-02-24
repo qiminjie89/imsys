@@ -1,9 +1,18 @@
 # Gateway 配置文件
 
+gateway:
+  id: "gateway-1"
+  ip: "127.0.0.1"
+  port: 8080
+
 server:
   id: "gateway-1"
   addr: ":8080"              # WebSocket 监听地址
   health_addr: ":8081"       # 健康检查端口
+
+# 认证配置（空则为开发模式）
+auth:
+  jwt_secret: ""
 
 websocket:
   read_buffer_size: 4096
@@ -37,20 +46,22 @@ roomserver:
   reconnect_interval: 1s
   reconnect_max_interval: 30s
 
-# Kafka 配置
+# Kafka 配置（留空禁用）
 kafka:
-  brokers:
-    - "localhost:9092"
-  topic: "im-business-requests"
+  brokers: []                         # 空数组禁用 Kafka
+  # brokers:
+  #   - "localhost:9092"
+  push_topic: ""                      # 数据面（推送消息）
+  biz_topic: ""                       # 业务请求转发
   batch_size: 100
   batch_timeout: 10ms
 
-# Nacos 配置
+# Nacos 配置（留空禁用服务发现，使用默认地址）
 nacos:
-  server_addr: "localhost:8848"
-  namespace: "imsys"
-  service_name: "imsys-gateway"
-  roomserver_service: "imsys-roomserver"
+  server_addr: ""
+  namespace: ""
+  service_name: ""
+  roomserver_service: ""
 
 # 日志配置
 log:

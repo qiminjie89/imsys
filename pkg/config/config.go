@@ -10,6 +10,7 @@ import (
 
 // GatewayConfig Gateway 配置
 type GatewayConfig struct {
+	Gateway     GatewayIdentity   `yaml:"gateway"`
 	Server      ServerConfig      `yaml:"server"`
 	WebSocket   WebSocketConfig   `yaml:"websocket"`
 	Distributor DistributorConfig `yaml:"distributor"`
@@ -17,20 +18,39 @@ type GatewayConfig struct {
 	Protection  ProtectionConfig  `yaml:"protection"`
 	Roomserver  RoomserverClient  `yaml:"roomserver"`
 	Kafka       KafkaConfig       `yaml:"kafka"`
+	Auth        AuthConfig        `yaml:"auth"`
 	Nacos       NacosConfig       `yaml:"nacos"`
 	Log         LogConfig         `yaml:"log"`
 	Metrics     MetricsConfig     `yaml:"metrics"`
 }
 
+// AuthConfig 认证配置
+type AuthConfig struct {
+	JWTSecret string `yaml:"jwt_secret"` // JWT 密钥（空则为开发模式，不验证 token）
+}
+
+// GatewayIdentity Gateway 标识配置
+type GatewayIdentity struct {
+	ID   string `yaml:"id"`   // Gateway 唯一标识
+	IP   string `yaml:"ip"`   // 监听 IP
+	Port int    `yaml:"port"` // 监听端口
+}
+
 // RoomserverConfig Roomserver 配置
 type RoomserverConfig struct {
-	Server   RoomserverServerConfig `yaml:"server"`
-	Room     RoomConfig             `yaml:"room"`
-	Recovery RecoveryConfig         `yaml:"recovery"`
-	HashRing HashRingConfig         `yaml:"hashring"`
-	Nacos    NacosConfig            `yaml:"nacos"`
-	Log      LogConfig              `yaml:"log"`
-	Metrics  MetricsConfig          `yaml:"metrics"`
+	Server     RoomserverServerConfig `yaml:"server"`
+	Room       RoomConfig             `yaml:"room"`
+	Recovery   RecoveryConfig         `yaml:"recovery"`
+	Disconnect DisconnectConfig       `yaml:"disconnect"`
+	HashRing   HashRingConfig         `yaml:"hashring"`
+	Nacos      NacosConfig            `yaml:"nacos"`
+	Log        LogConfig              `yaml:"log"`
+	Metrics    MetricsConfig          `yaml:"metrics"`
+}
+
+// DisconnectConfig 断连超时配置
+type DisconnectConfig struct {
+	Timeout int `yaml:"timeout"` // 秒
 }
 
 // ServerConfig 服务器基础配置
@@ -108,7 +128,8 @@ type HashRingConfig struct {
 // KafkaConfig Kafka 配置
 type KafkaConfig struct {
 	Brokers      []string      `yaml:"brokers"`
-	Topic        string        `yaml:"topic"`
+	PushTopic    string        `yaml:"push_topic"`    // im_msg_broadcast（数据面）
+	BizTopic     string        `yaml:"biz_topic"`     // im_biz_request（业务请求）
 	BatchSize    int           `yaml:"batch_size"`
 	BatchTimeout time.Duration `yaml:"batch_timeout"`
 }

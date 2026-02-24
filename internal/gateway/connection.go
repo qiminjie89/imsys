@@ -225,7 +225,8 @@ func (c *Connection) Close(reason string) {
 			// 如果在房间中，移除并通知 Roomserver
 			if c.RoomID != "" && c.JoinState == protocol.JoinStateConfirmed {
 				c.server.RemoveUserFromRoom(c.RoomID, c.UserID)
-				// TODO: 通知 Roomserver 断连
+				// 通知 Roomserver 断连（根据服务状态决定立即发送还是暂存）
+				c.server.notifyDisconnect(c.UserID, c.RoomID)
 			}
 		}
 	})
@@ -284,8 +285,14 @@ func isTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	// 简单判断
-	return err.Error() == "i/o timeout"
+	// 使用 net.Error 接口判断
+	type netError interface {
+		Timeout() bool
+	}
+	if ne, ok := err.(netError); ok {
+		return ne.Timeout()
+	}
+	return false
 }
 
 // msgTypeName 返回消息类型名称

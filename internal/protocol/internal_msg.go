@@ -90,12 +90,13 @@ type MulticastMessage struct {
 
 // EpochNotify Epoch 变更通知
 type EpochNotify struct {
-	Epoch     uint64 `msgpack:"epoch"`
+	ServerID  string `msgpack:"server_id"` // Roomserver 实例 ID
+	Epoch     uint64 `msgpack:"epoch"`     // 启动时间戳（毫秒）
 	Timestamp int64  `msgpack:"ts"`
 }
 
-// RoomClose 房间关闭通知
-type RoomClose struct {
+// RoomCloseNotify 房间关闭通知
+type RoomCloseNotify struct {
 	RoomID string `msgpack:"room_id"`
 	Reason string `msgpack:"reason"` // ended, banned, etc.
 }

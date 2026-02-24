@@ -2,10 +2,16 @@ package gateway
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+
+	pb "github.com/qiminjie89/imsys/api/proto/gen"
 	"github.com/qiminjie89/imsys/internal/protocol"
 	"github.com/qiminjie89/imsys/pkg/config"
 	"github.com/qiminjie89/imsys/pkg/logger"
@@ -18,8 +24,16 @@ type RoomserverClient struct {
 	cfg       *config.RoomserverClient
 	connected atomic.Bool
 
+	// gRPC 连接
+	conn   *grpc.ClientConn
+	client pb.RoomServerGatewayClient
+	stream pb.RoomServerGateway_ChannelClient
+
 	// 发送队列
-	sendCh chan *protocol.Frame
+	sendCh chan *pb.Envelope
+
+	// 当前连接的 Roomserver 地址
+	currentAddr string
 
 	mu sync.RWMutex
 }
@@ -29,41 +43,208 @@ func NewRoomserverClient(server *Server, cfg *config.RoomserverClient) *Roomserv
 	return &RoomserverClient{
 		server: server,
 		cfg:    cfg,
-		sendCh: make(chan *protocol.Frame, 10000),
+		sendCh: make(chan *pb.Envelope, 10000),
 	}
 }
 
-// Run 运行客户端
+// Run 运行客户端（自动重连）
 func (c *RoomserverClient) Run(ctx context.Context) {
+	reconnectInterval := c.cfg.ReconnectInterval
+	maxInterval := c.cfg.ReconnectMaxInterval
+
 	for {
 		select {
 		case <-ctx.Done():
+			c.close()
 			return
 		default:
-			c.connect(ctx)
-			// 重连间隔
-			time.Sleep(c.cfg.ReconnectInterval)
+			if err := c.connectAndServe(ctx); err != nil {
+				logger.Warn("roomserver connection error",
+					zap.Error(err),
+					zap.Duration("reconnect_in", reconnectInterval),
+				)
+				// 确保设置为降级状态
+				c.connected.Store(false)
+				c.server.SetDegraded()
+			}
+
+			// 指数退避重连
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectInterval):
+			}
+
+			reconnectInterval = reconnectInterval * 2
+			if reconnectInterval > maxInterval {
+				reconnectInterval = maxInterval
+			}
 		}
 	}
 }
 
-// connect 连接到 Roomserver
-func (c *RoomserverClient) connect(ctx context.Context) {
-	// TODO: 从 Nacos 获取 Roomserver 地址
-	// TODO: 建立 gRPC stream 连接
+// connectAndServe 连接并服务
+func (c *RoomserverClient) connectAndServe(ctx context.Context) error {
+	// 获取 Roomserver 地址（从 Nacos 或配置）
+	addr := c.getRoomserverAddr()
+	if addr == "" {
+		return nil
+	}
 
-	logger.Info("connecting to roomserver")
+	logger.Info("connecting to roomserver", zap.String("addr", addr))
 
-	// 模拟连接成功
+	// 建立 gRPC 连接
+	conn, err := grpc.DialContext(ctx, addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	c.conn = conn
+	c.client = pb.NewRoomServerGatewayClient(conn)
+	c.currentAddr = addr
+	c.mu.Unlock()
+
+	// 建立双向流
+	stream, err := c.client.Channel(ctx)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+
+	c.mu.Lock()
+	c.stream = stream
+	c.mu.Unlock()
+
 	c.connected.Store(true)
-	defer c.connected.Store(false)
+	c.server.SetNormal() // 恢复正常状态
 
-	// TODO: 启动收发循环
-	// go c.sendLoop(ctx, stream)
-	// c.recvLoop(ctx, stream)
+	logger.Info("connected to roomserver", zap.String("addr", addr))
 
-	// 暂时阻塞
-	<-ctx.Done()
+	// 发送 Gateway 信息
+	c.sendGatewayInfo()
+
+	// 启动收发循环
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- c.sendLoop(ctx, stream)
+	}()
+
+	go func() {
+		errCh <- c.recvLoop(ctx, stream)
+	}()
+
+	// 等待任一方出错
+	err = <-errCh
+
+	c.connected.Store(false)
+	c.server.SetDegraded() // 进入降级状态
+
+	c.close()
+
+	return err
+}
+
+// getRoomserverAddr 获取 Roomserver 地址
+func (c *RoomserverClient) getRoomserverAddr() string {
+	// 优先从 Nacos 获取
+	if c.server.nacosClient != nil {
+		serviceName := c.server.cfg.Nacos.RoomserverService
+		if serviceName == "" {
+			serviceName = "roomserver"
+		}
+
+		instance := c.server.nacosClient.GetHealthyInstance(serviceName)
+		if instance != nil {
+			return instance.Address()
+		}
+
+		logger.Warn("no healthy roomserver instance from nacos")
+	}
+
+	// 回退到默认地址
+	return "localhost:9000"
+}
+
+// sendLoop 发送循环
+func (c *RoomserverClient) sendLoop(ctx context.Context, stream pb.RoomServerGateway_ChannelClient) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case envelope, ok := <-c.sendCh:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(envelope); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// recvLoop 接收循环
+func (c *RoomserverClient) recvLoop(ctx context.Context, stream pb.RoomServerGateway_ChannelClient) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			envelope, err := stream.Recv()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			c.handleEnvelope(envelope)
+		}
+	}
+}
+
+// handleEnvelope 处理收到的消息
+func (c *RoomserverClient) handleEnvelope(envelope *pb.Envelope) {
+	switch envelope.MsgType {
+	case protocol.InternalMsgJoinRoomAck:
+		c.handleJoinRoomAck(envelope.Payload)
+	case protocol.InternalMsgBroadcast:
+		c.handleBroadcast(envelope.Payload)
+	case protocol.InternalMsgUnicast:
+		c.handleUnicast(envelope.Payload)
+	case protocol.InternalMsgMulticast:
+		c.handleMulticast(envelope.Payload)
+	case protocol.InternalMsgEpochNotify:
+		c.handleEpochNotify(envelope.Payload)
+	case protocol.InternalMsgRoomClose:
+		c.handleRoomClose(envelope.Payload)
+	default:
+		logger.Warn("unknown internal message type",
+			zap.Uint32("msg_type", envelope.MsgType),
+		)
+	}
+}
+
+// close 关闭连接
+func (c *RoomserverClient) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.stream != nil {
+		c.stream.CloseSend()
+		c.stream = nil
+	}
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
 }
 
 // IsConnected 返回是否已连接
@@ -71,21 +252,43 @@ func (c *RoomserverClient) IsConnected() bool {
 	return c.connected.Load()
 }
 
+// send 发送消息
+func (c *RoomserverClient) send(msgType uint32, payload []byte) {
+	envelope := &pb.Envelope{
+		MsgType: msgType,
+		Payload: payload,
+	}
+
+	select {
+	case c.sendCh <- envelope:
+	default:
+		logger.Warn("roomserver send queue full, dropping message",
+			zap.Uint32("msg_type", msgType),
+		)
+	}
+}
+
+// sendGatewayInfo 发送 Gateway 信息
+func (c *RoomserverClient) sendGatewayInfo() {
+	info := &protocol.GatewayInfo{
+		GatewayID: c.server.cfg.Gateway.ID,
+		Addr:      c.server.cfg.Server.Addr,
+	}
+
+	payload, _ := protocol.Encode(info)
+	c.send(protocol.InternalMsgGatewayInfo, payload)
+}
+
 // SendJoinRoom 发送 JoinRoom 请求
 func (c *RoomserverClient) SendJoinRoom(userID, roomID string) {
 	req := &protocol.JoinRoomRequest{
 		UserID:    userID,
 		RoomID:    roomID,
-		GatewayID: c.server.cfg.Server.ID,
+		GatewayID: c.server.cfg.Gateway.ID,
 	}
 
 	payload, _ := protocol.Encode(req)
-	frame := &protocol.Frame{
-		MsgType: protocol.InternalMsgJoinRoom,
-		Payload: payload,
-	}
-
-	c.send(frame)
+	c.send(protocol.InternalMsgJoinRoom, payload)
 }
 
 // SendLeaveRoom 发送 LeaveRoom 请求
@@ -96,12 +299,7 @@ func (c *RoomserverClient) SendLeaveRoom(userID, roomID string) {
 	}
 
 	payload, _ := protocol.Encode(req)
-	frame := &protocol.Frame{
-		MsgType: protocol.InternalMsgLeaveRoom,
-		Payload: payload,
-	}
-
-	c.send(frame)
+	c.send(protocol.InternalMsgLeaveRoom, payload)
 }
 
 // SendResume 发送 Resume 请求
@@ -109,71 +307,40 @@ func (c *RoomserverClient) SendResume(userID, roomID string) {
 	req := &protocol.ResumeRequest{
 		UserID:    userID,
 		RoomID:    roomID,
-		GatewayID: c.server.cfg.Server.ID,
+		GatewayID: c.server.cfg.Gateway.ID,
 	}
 
 	payload, _ := protocol.Encode(req)
-	frame := &protocol.Frame{
-		MsgType: protocol.InternalMsgResume,
-		Payload: payload,
+	c.send(protocol.InternalMsgResume, payload)
+}
+
+// SendDisconnect 发送用户断连通知
+func (c *RoomserverClient) SendDisconnect(userID, roomID string) {
+	req := &protocol.DisconnectNotify{
+		UserID:    userID,
+		RoomID:    roomID,
+		GatewayID: c.server.cfg.Gateway.ID,
 	}
 
-	c.send(frame)
+	payload, _ := protocol.Encode(req)
+	c.send(protocol.InternalMsgDisconnect, payload)
 }
 
 // SendBatchReSync 发送 BatchReSync
 func (c *RoomserverClient) SendBatchReSync(users []protocol.UserRoomPair) {
 	req := &protocol.BatchReSync{
-		GatewayID: c.server.cfg.Server.ID,
+		GatewayID: c.server.cfg.Gateway.ID,
 		Users:     users,
 	}
 
 	payload, _ := protocol.Encode(req)
-	frame := &protocol.Frame{
-		MsgType: protocol.InternalMsgBatchReSync,
-		Payload: payload,
-	}
-
-	c.send(frame)
-}
-
-// send 发送消息
-func (c *RoomserverClient) send(frame *protocol.Frame) {
-	select {
-	case c.sendCh <- frame:
-	default:
-		logger.Warn("roomserver send queue full, dropping message",
-			zap.Uint32("msg_type", frame.MsgType),
-		)
-	}
-}
-
-// handleMessage 处理从 Roomserver 收到的消息
-func (c *RoomserverClient) handleMessage(frame *protocol.Frame) {
-	switch frame.MsgType {
-	case protocol.InternalMsgJoinRoomAck:
-		c.handleJoinRoomAck(frame)
-	case protocol.InternalMsgBroadcast:
-		c.handleBroadcast(frame)
-	case protocol.InternalMsgUnicast:
-		c.handleUnicast(frame)
-	case protocol.InternalMsgMulticast:
-		c.handleMulticast(frame)
-	case protocol.InternalMsgEpochNotify:
-		c.handleEpochNotify(frame)
-	case protocol.InternalMsgRoomClose:
-		c.handleRoomClose(frame)
-	default:
-		logger.Warn("unknown internal message type",
-			zap.Uint32("msg_type", frame.MsgType),
-		)
-	}
+	c.send(protocol.InternalMsgBatchReSync, payload)
 }
 
 // handleJoinRoomAck 处理 JoinRoom ACK
-func (c *RoomserverClient) handleJoinRoomAck(frame *protocol.Frame) {
+func (c *RoomserverClient) handleJoinRoomAck(payload []byte) {
 	var ack protocol.JoinRoomAck
-	if err := protocol.Decode(frame.Payload, &ack); err != nil {
+	if err := protocol.Decode(payload, &ack); err != nil {
 		logger.Warn("decode join room ack failed", zap.Error(err))
 		return
 	}
@@ -181,10 +348,10 @@ func (c *RoomserverClient) handleJoinRoomAck(frame *protocol.Frame) {
 	c.server.OnJoinRoomAck(ack.UserID, ack.RoomID, ack.Success, ack.Code, ack.Message)
 }
 
-// handleBroadcast 处理广播消息
-func (c *RoomserverClient) handleBroadcast(frame *protocol.Frame) {
+// handleBroadcast 处理广播消息（控制面，非 Kafka 数据面）
+func (c *RoomserverClient) handleBroadcast(payload []byte) {
 	var msg protocol.BroadcastMessage
-	if err := protocol.Decode(frame.Payload, &msg); err != nil {
+	if err := protocol.Decode(payload, &msg); err != nil {
 		logger.Warn("decode broadcast message failed", zap.Error(err))
 		return
 	}
@@ -195,23 +362,27 @@ func (c *RoomserverClient) handleBroadcast(frame *protocol.Frame) {
 		return
 	}
 
-	// 构造分发消息
-	dispatchMsg := &DispatchMessage{
-		Priority: protocol.PriorityNormal, // TODO: 从消息中解析优先级
-		Payload:  msg.Payload,
-		RoomID:   msg.RoomID,
+	// 构造推送帧
+	pushFrame := &protocol.Frame{
+		MsgType: protocol.MsgTypePushMessage,
+		Seq:     msg.Seq,
+		Payload: msg.Payload,
 	}
+	data := protocol.EncodeFrame(pushFrame)
 
-	// 分发到各个 Distributor
-	for _, d := range c.server.distributors {
-		d.Enqueue(dispatchMsg)
+	// 分发给用户
+	for _, userID := range users {
+		conn := c.server.GetConnection(userID)
+		if conn != nil {
+			conn.Send(data)
+		}
 	}
 }
 
 // handleUnicast 处理单播消息
-func (c *RoomserverClient) handleUnicast(frame *protocol.Frame) {
+func (c *RoomserverClient) handleUnicast(payload []byte) {
 	var msg protocol.UnicastMessage
-	if err := protocol.Decode(frame.Payload, &msg); err != nil {
+	if err := protocol.Decode(payload, &msg); err != nil {
 		logger.Warn("decode unicast message failed", zap.Error(err))
 		return
 	}
@@ -221,44 +392,55 @@ func (c *RoomserverClient) handleUnicast(frame *protocol.Frame) {
 		return
 	}
 
-	conn.Send(msg.Payload)
+	// 构造推送帧
+	pushFrame := &protocol.Frame{
+		MsgType: protocol.MsgTypePushMessage,
+		Payload: msg.Payload,
+	}
+	data := protocol.EncodeFrame(pushFrame)
+	conn.Send(data)
 }
 
 // handleMulticast 处理多播消息
-func (c *RoomserverClient) handleMulticast(frame *protocol.Frame) {
+func (c *RoomserverClient) handleMulticast(payload []byte) {
 	var msg protocol.MulticastMessage
-	if err := protocol.Decode(frame.Payload, &msg); err != nil {
+	if err := protocol.Decode(payload, &msg); err != nil {
 		logger.Warn("decode multicast message failed", zap.Error(err))
 		return
 	}
 
-	// 分发到各个 Distributor
-	dispatchMsg := &DispatchMessage{
-		Priority: protocol.PriorityNormal,
-		Payload:  msg.Payload,
-		RoomID:   msg.RoomID,
-		UserIDs:  msg.UserIDs,
+	// 构造推送帧
+	pushFrame := &protocol.Frame{
+		MsgType: protocol.MsgTypePushMessage,
+		Payload: msg.Payload,
 	}
+	data := protocol.EncodeFrame(pushFrame)
 
-	for _, d := range c.server.distributors {
-		d.Enqueue(dispatchMsg)
+	// 分发给指定用户
+	for _, userID := range msg.UserIDs {
+		conn := c.server.GetConnection(userID)
+		if conn != nil {
+			conn.Send(data)
+		}
 	}
 }
 
 // handleEpochNotify 处理 Epoch 变更通知
-func (c *RoomserverClient) handleEpochNotify(frame *protocol.Frame) {
+func (c *RoomserverClient) handleEpochNotify(payload []byte) {
 	var notify protocol.EpochNotify
-	if err := protocol.Decode(frame.Payload, &notify); err != nil {
+	if err := protocol.Decode(payload, &notify); err != nil {
 		logger.Warn("decode epoch notify failed", zap.Error(err))
 		return
 	}
 
-	if notify.Epoch > c.server.knownEpoch {
+	oldEpoch := c.server.knownEpochs[notify.ServerID]
+	if notify.Epoch > oldEpoch {
 		logger.Info("epoch changed, starting resync",
-			zap.Uint64("old_epoch", c.server.knownEpoch),
+			zap.String("server_id", notify.ServerID),
+			zap.Uint64("old_epoch", oldEpoch),
 			zap.Uint64("new_epoch", notify.Epoch),
 		)
-		c.server.knownEpoch = notify.Epoch
+		c.server.knownEpochs[notify.ServerID] = notify.Epoch
 
 		// 触发渐进式 BatchReSync
 		go c.startProgressiveReSync()
@@ -266,9 +448,9 @@ func (c *RoomserverClient) handleEpochNotify(frame *protocol.Frame) {
 }
 
 // handleRoomClose 处理房间关闭通知
-func (c *RoomserverClient) handleRoomClose(frame *protocol.Frame) {
-	var msg protocol.RoomClose
-	if err := protocol.Decode(frame.Payload, &msg); err != nil {
+func (c *RoomserverClient) handleRoomClose(payload []byte) {
+	var msg protocol.RoomCloseNotify
+	if err := protocol.Decode(payload, &msg); err != nil {
 		logger.Warn("decode room close failed", zap.Error(err))
 		return
 	}
@@ -281,13 +463,29 @@ func (c *RoomserverClient) handleRoomClose(frame *protocol.Frame) {
 	// 获取并清理房间用户
 	users := c.server.ClearRoom(msg.RoomID)
 
+	// 构造房间关闭通知
+	closeNotify := struct {
+		RoomID string `msgpack:"room_id"`
+		Reason string `msgpack:"reason"`
+	}{
+		RoomID: msg.RoomID,
+		Reason: msg.Reason,
+	}
+	notifyPayload, _ := protocol.Encode(closeNotify)
+
+	pushFrame := &protocol.Frame{
+		MsgType: protocol.MsgTypePushMessage,
+		Payload: notifyPayload,
+	}
+	data := protocol.EncodeFrame(pushFrame)
+
 	// 通知用户
 	for _, userID := range users {
 		conn := c.server.GetConnection(userID)
 		if conn != nil {
 			conn.JoinState = protocol.JoinStateInit
 			conn.RoomID = ""
-			// TODO: 发送 RoomClosed 通知给客户端
+			conn.Send(data)
 		}
 	}
 }
@@ -334,15 +532,10 @@ func (c *RoomserverClient) sendReSyncComplete() {
 	}
 
 	req := &protocol.ReSyncComplete{
-		GatewayID:  c.server.cfg.Server.ID,
+		GatewayID:  c.server.cfg.Gateway.ID,
 		TotalUsers: totalUsers,
 	}
 
 	payload, _ := protocol.Encode(req)
-	frame := &protocol.Frame{
-		MsgType: protocol.InternalMsgReSyncComplete,
-		Payload: payload,
-	}
-
-	c.send(frame)
+	c.send(protocol.InternalMsgReSyncComplete, payload)
 }

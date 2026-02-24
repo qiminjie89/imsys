@@ -42,9 +42,9 @@ func (s *Server) runHealthServer() {
 
 // healthHandler 健康检查处理
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
-	s.connMu.RLock()
+	s.connsMu.RLock()
 	connCount := len(s.connections)
-	s.connMu.RUnlock()
+	s.connsMu.RUnlock()
 
 	health := &HealthStatus{
 		Connections:         connCount,

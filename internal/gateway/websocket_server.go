@@ -1,14 +1,22 @@
 package gateway
 
 import (
+	"errors"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/qiminjie89/imsys/internal/protocol"
+	"github.com/qiminjie89/imsys/pkg/auth"
 	"github.com/qiminjie89/imsys/pkg/logger"
 	"github.com/qiminjie89/imsys/pkg/metrics"
 	"go.uber.org/zap"
+)
+
+var (
+	ErrAuthTimeout = errors.New("authentication timeout")
+	ErrInvalidAuth = errors.New("invalid authentication")
 )
 
 var upgrader = websocket.Upgrader{
@@ -24,7 +32,7 @@ func (s *Server) runWebSocketServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
-	server := &http.Server{
+	s.httpServer = &http.Server{
 		Addr:    s.cfg.Server.Addr,
 		Handler: mux,
 	}
@@ -33,7 +41,7 @@ func (s *Server) runWebSocketServer() {
 		zap.String("addr", s.cfg.Server.Addr),
 	)
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("websocket server error", zap.Error(err))
 	}
 }
@@ -46,13 +54,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 设置握手超时
+	ws.SetReadDeadline(time.Now().Add(s.cfg.WebSocket.HandshakeTimeout))
+
 	// 等待认证消息
 	userID, err := s.authenticate(ws)
 	if err != nil {
-		logger.Warn("authentication failed", zap.Error(err))
+		logger.Warn("authentication failed",
+			zap.Error(err),
+			zap.String("remote_addr", r.RemoteAddr),
+		)
+		s.sendAuthResp(ws, false, "", protocol.ErrCodeAuthFailed, err.Error())
 		ws.Close()
 		return
 	}
+
+	// 清除读超时
+	ws.SetReadDeadline(time.Time{})
 
 	connID := uuid.New().String()
 
@@ -76,41 +94,85 @@ func (s *Server) authenticate(ws *websocket.Conn) (string, error) {
 	// 读取第一条消息作为认证请求
 	_, data, err := ws.ReadMessage()
 	if err != nil {
-		return "", err
+		return "", ErrAuthTimeout
 	}
 
-	// TODO: 解析认证消息，验证 JWT
-	// 这里简化处理，从消息中提取 user_id
+	// 解析认证帧
+	frame, err := protocol.DecodeFrame(data)
+	if err != nil {
+		return "", ErrInvalidAuth
+	}
 
+	if frame.MsgType != protocol.MsgTypeAuth {
+		return "", ErrInvalidAuth
+	}
+
+	// 解析认证 payload
 	var authReq struct {
 		Token  string `msgpack:"token"`
-		UserID string `msgpack:"user_id"`
+		UserID string `msgpack:"user_id"` // 兼容开发环境
 	}
 
-	// 尝试解析
-	if err := msgpackDecode(data, &authReq); err != nil {
-		return "", err
+	if err := protocol.Decode(frame.Payload, &authReq); err != nil {
+		return "", ErrInvalidAuth
 	}
 
-	// TODO: 验证 token
-	// jwtToken, err := jwt.Parse(authReq.Token, ...)
+	// 验证 JWT Token
+	var userID string
+
+	if s.jwtValidator != nil {
+		claims, err := s.jwtValidator.ValidateOrMock(authReq.Token, authReq.UserID)
+		if err != nil {
+			if errors.Is(err, auth.ErrTokenExpired) {
+				s.sendAuthResp(ws, false, "", protocol.ErrCodeTokenExpired, "token expired")
+				return "", err
+			}
+			return "", ErrInvalidAuth
+		}
+		userID = claims.UserID
+	} else {
+		// 未配置 JWT 验证器，使用请求中的 user_id（仅开发环境）
+		userID = authReq.UserID
+	}
+
+	if userID == "" {
+		return "", ErrInvalidAuth
+	}
 
 	// 发送认证成功响应
-	s.sendAuthResp(ws, true, authReq.UserID)
+	s.sendAuthResp(ws, true, userID, protocol.ErrCodeSuccess, "")
 
-	return authReq.UserID, nil
+	return userID, nil
 }
 
 // sendAuthResp 发送认证响应
-func (s *Server) sendAuthResp(ws *websocket.Conn, success bool, userID string) {
-	// TODO: 实现
-}
-
-// msgpackDecode 简单的 msgpack 解码（跳过帧头）
-func msgpackDecode(data []byte, v interface{}) error {
-	// 跳过帧头（16字节），直接解码 payload
-	if len(data) < 16 {
-		return nil
+func (s *Server) sendAuthResp(ws *websocket.Conn, success bool, userID string, code int, message string) {
+	resp := struct {
+		Success   bool   `msgpack:"success"`
+		UserID    string `msgpack:"user_id,omitempty"`
+		GatewayID string `msgpack:"gateway_id,omitempty"`
+		Code      int    `msgpack:"code"`
+		Message   string `msgpack:"message,omitempty"`
+	}{
+		Success:   success,
+		UserID:    userID,
+		GatewayID: s.cfg.Gateway.ID,
+		Code:      code,
+		Message:   message,
 	}
-	return protocol.Decode(data[16:], v)
+
+	payload, err := protocol.Encode(resp)
+	if err != nil {
+		logger.Warn("encode auth response failed", zap.Error(err))
+		return
+	}
+
+	frame := &protocol.Frame{
+		MsgType: protocol.MsgTypeAuthResp,
+		Seq:     0,
+		Payload: payload,
+	}
+
+	data := protocol.EncodeFrame(frame)
+	ws.WriteMessage(websocket.BinaryMessage, data)
 }

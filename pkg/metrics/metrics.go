@@ -59,6 +59,43 @@ var (
 		Name: "gateway_distributor_queue_size",
 		Help: "Distributor input queue size",
 	}, []string{"shard"})
+
+	// Kafka 消费指标（数据面）
+	GatewayKafkaMessageReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_kafka_messages_received_total",
+		Help: "Total messages received from Kafka",
+	})
+
+	GatewayKafkaMessageFiltered = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_kafka_messages_filtered_total",
+		Help: "Total messages filtered (not for this gateway)",
+	})
+
+	GatewayKafkaMessageDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_kafka_messages_dropped_total",
+		Help: "Total messages dropped due to parse error",
+	})
+
+	// 消息类型统计
+	GatewayBroadcastMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_broadcast_messages_total",
+		Help: "Total room broadcast messages processed",
+	})
+
+	GatewayUnicastMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_unicast_messages_total",
+		Help: "Total unicast messages processed",
+	})
+
+	GatewayMulticastMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_multicast_messages_total",
+		Help: "Total multicast messages processed",
+	})
+
+	GatewayPlatformBroadcastMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gateway_platform_broadcast_messages_total",
+		Help: "Total platform broadcast messages processed",
+	})
 )
 
 // Roomserver 指标

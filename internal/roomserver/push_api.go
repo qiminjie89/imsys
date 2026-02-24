@@ -14,7 +14,8 @@ import (
 func (s *Server) runHTTPServer() {
 	mux := http.NewServeMux()
 
-	// 推送接口
+	// 推送接口（通过控制面发送，仅适用于小规模场景）
+	// 注意：大规模推送建议通过 Kafka 数据面（Python → Kafka → Gateway）
 	mux.HandleFunc("/api/v1/push/unicast", s.handleUnicast)
 	mux.HandleFunc("/api/v1/push/multicast", s.handleMulticast)
 	mux.HandleFunc("/api/v1/push/room_broadcast", s.handleRoomBroadcast)
@@ -87,15 +88,15 @@ func (s *Server) handleUnicast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查找用户
-	user := s.GetUser(req.UserID)
-	if user == nil {
+	// 查找用户会话
+	session := s.sessionSvc.GetSession(req.UserID)
+	if session == nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 
 	// 发送到 Gateway
-	gw := s.GetGateway(user.GatewayID)
+	gw := s.GetGateway(session.GatewayID)
 	if gw == nil {
 		http.Error(w, "gateway not found", http.StatusNotFound)
 		return
@@ -133,9 +134,9 @@ func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
 	// 按 gateway_id 分组
 	gatewayUsers := make(map[string][]string)
 	for _, userID := range req.UserIDs {
-		user := s.GetUser(userID)
-		if user != nil {
-			gatewayUsers[user.GatewayID] = append(gatewayUsers[user.GatewayID], userID)
+		session := s.sessionSvc.GetSession(userID)
+		if session != nil {
+			gatewayUsers[session.GatewayID] = append(gatewayUsers[session.GatewayID], userID)
 		}
 	}
 
@@ -160,6 +161,7 @@ func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRoomBroadcast 处理房间广播
+// 注意：大规模场景建议使用 Kafka 数据面（Python → Kafka → Gateway）
 func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -178,17 +180,33 @@ func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取房间
-	room := s.GetRoom(req.RoomID)
+	room := s.roomSvc.GetRoom(req.RoomID)
 	if room == nil {
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
 
-	// 提交广播请求到房间队列
-	if !room.Broadcast(req.Message) {
-		http.Error(w, "room queue full", http.StatusServiceUnavailable)
+	// 获取房间涉及的所有 Gateway
+	gatewayIDs := s.roomSvc.GetRoomGatewayIDs(req.RoomID)
+	if len(gatewayIDs) == 0 {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "note": "no gateways"})
 		return
 	}
+
+	// 发送广播到各个 Gateway
+	msg := &protocol.BroadcastMessage{
+		RoomID:  req.RoomID,
+		Payload: req.Message,
+	}
+
+	s.gatewaysMu.RLock()
+	for _, gwID := range gatewayIDs {
+		if gw, ok := s.gateways[gwID]; ok {
+			gw.SendBroadcast(msg)
+		}
+	}
+	s.gatewaysMu.RUnlock()
 
 	metrics.RoomserverBroadcasts.WithLabelValues("room").Inc()
 	w.WriteHeader(http.StatusOK)
@@ -196,6 +214,7 @@ func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGlobalBroadcast 处理全局广播
+// 注意：大规模场景建议使用 Kafka 数据面（Python → Kafka → Gateway）
 func (s *Server) handleGlobalBroadcast(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -213,17 +232,29 @@ func (s *Server) handleGlobalBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 遍历所有房间广播
-	s.roomsMu.RLock()
-	rooms := make([]*Room, 0, len(s.rooms))
-	for _, room := range s.rooms {
-		rooms = append(rooms, room)
-	}
-	s.roomsMu.RUnlock()
+	// 获取所有房间 ID
+	roomIDs := s.roomSvc.GetAllRoomIDs()
 
-	for _, room := range rooms {
-		room.Broadcast(req.Message)
+	// 收集所有涉及的 Gateway
+	allGatewayIDs := make(map[string]bool)
+	for _, roomID := range roomIDs {
+		for _, gwID := range s.roomSvc.GetRoomGatewayIDs(roomID) {
+			allGatewayIDs[gwID] = true
+		}
 	}
+
+	// 广播给所有 Gateway（平台广播）
+	msg := &protocol.BroadcastMessage{
+		Payload: req.Message,
+	}
+
+	s.gatewaysMu.RLock()
+	for gwID := range allGatewayIDs {
+		if gw, ok := s.gateways[gwID]; ok {
+			gw.SendBroadcast(msg)
+		}
+	}
+	s.gatewaysMu.RUnlock()
 
 	metrics.RoomserverBroadcasts.WithLabelValues("global").Inc()
 	w.WriteHeader(http.StatusOK)
@@ -243,17 +274,17 @@ func (s *Server) handleRoomClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room := s.GetRoom(req.RoomID)
+	room := s.roomSvc.GetRoom(req.RoomID)
 	if room == nil {
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
 
 	// 获取房间的所有 Gateway
-	gatewayIDs := room.GetGatewayIDs()
+	gatewayIDs := s.roomSvc.GetRoomGatewayIDs(req.RoomID)
 
 	// 通知所有 Gateway
-	closeMsg := &protocol.RoomClose{
+	closeMsg := &protocol.RoomCloseNotify{
 		RoomID: req.RoomID,
 		Reason: req.Reason,
 	}
@@ -267,7 +298,7 @@ func (s *Server) handleRoomClose(w http.ResponseWriter, r *http.Request) {
 	s.gatewaysMu.RUnlock()
 
 	// 清理房间
-	s.RemoveRoom(req.RoomID)
+	s.roomSvc.CloseRoom(req.RoomID)
 
 	logger.Info("room closed",
 		zap.String("room_id", req.RoomID),

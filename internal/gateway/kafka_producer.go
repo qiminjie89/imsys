@@ -31,9 +31,15 @@ type BizMessage struct {
 
 // NewKafkaProducer 创建 Kafka 生产者
 func NewKafkaProducer(cfg *config.KafkaConfig) (*KafkaProducer, error) {
+	// 如果没有配置 Kafka，返回 nil
+	if len(cfg.Brokers) == 0 || cfg.BizTopic == "" {
+		logger.Warn("kafka producer disabled (no brokers or topic configured)")
+		return nil, nil
+	}
+
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(cfg.Brokers...),
-		Topic:        cfg.Topic,
+		Topic:        cfg.BizTopic,
 		Balancer:     &kafka.LeastBytes{},
 		BatchSize:    cfg.BatchSize,
 		BatchTimeout: cfg.BatchTimeout,

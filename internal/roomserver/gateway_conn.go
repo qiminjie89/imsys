@@ -123,7 +123,7 @@ func (c *GatewayConn) SendEpochNotify(notify *protocol.EpochNotify) {
 }
 
 // SendRoomClose 发送房间关闭通知
-func (c *GatewayConn) SendRoomClose(msg *protocol.RoomClose) {
+func (c *GatewayConn) SendRoomClose(msg *protocol.RoomCloseNotify) {
 	payload, err := protocol.Encode(msg)
 	if err != nil {
 		logger.Warn("encode room close failed", zap.Error(err))

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/qiminjie89/imsys/internal/protocol"
 	"github.com/qiminjie89/imsys/pkg/config"
@@ -121,8 +122,10 @@ func (d *Distributor) checkAndCloseSlowConn(conn *Connection) {
 
 	// 队列满时间过长
 	if !h.QueueFullSince.IsZero() {
-		// 使用简单的时间比较
-		// TODO: 使用配置的超时值
+		if time.Since(h.QueueFullSince) >= d.protection.QueueFullTimeout {
+			conn.Close("queue_full_timeout")
+			return
+		}
 	}
 }
 

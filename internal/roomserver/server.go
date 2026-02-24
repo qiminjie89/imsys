@@ -1,4 +1,4 @@
-// Package roomserver 实现 IM 系统的房间服务
+// Package roomserver 实现 IM 系统的房间服务（控制面）
 package roomserver
 
 import (
@@ -15,23 +15,21 @@ import (
 )
 
 // Server Roomserver 服务器
+// 仅负责控制面：房间管理、会话管理
+// 消息推送通过 Kafka 直达 Gateway（数据面）
 type Server struct {
 	cfg *config.RoomserverConfig
 
 	// 服务状态
-	status atomic.Int32 // ServerStatus
-	epoch  atomic.Uint64
+	status atomic.Int32  // ServerStatus
+	epoch  atomic.Uint64 // 启动时间戳，用于检测重启
 
-	// 房间数据
-	rooms   map[string]*Room
-	roomsMu sync.RWMutex
-
-	// 用户会话
-	users   map[string]*UserState
-	usersMu sync.RWMutex
+	// 内部服务（职责分离）
+	roomSvc    *RoomService    // 房间管理（房间维度）
+	sessionSvc *SessionService // 会话管理（用户维度）
 
 	// Gateway 连接管理
-	gateways   map[string]*GatewayConn
+	gateways   map[string]*GatewayConnection
 	gatewaysMu sync.RWMutex
 
 	// 恢复状态
@@ -40,18 +38,20 @@ type Server struct {
 	// 一致性哈希（用于内部转发）
 	hashRing *HashRing
 
+	// Roomserver 集群（用于内部转发）
+	peers   map[string]*PeerConn
+	peersMu sync.RWMutex
+
 	// 生命周期
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-// UserState 用户状态
-type UserState struct {
-	UserID    string
-	RoomID    string
-	GatewayID string
-	Status    protocol.MemberStatus
+// PeerConn Roomserver 节点连接（用于内部转发）
+type PeerConn struct {
+	ServerID string
+	// TODO: gRPC 连接
 }
 
 // NewServer 创建 Roomserver
@@ -59,17 +59,20 @@ func NewServer(cfg *config.RoomserverConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		cfg:      cfg,
-		rooms:    make(map[string]*Room),
-		users:    make(map[string]*UserState),
-		gateways: make(map[string]*GatewayConn),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:        cfg,
+		roomSvc:    NewRoomService(),
+		sessionSvc: NewSessionService(),
+		gateways:   make(map[string]*GatewayConnection),
+		peers:      make(map[string]*PeerConn),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	// 初始化为恢复模式
 	s.status.Store(int32(protocol.ServerStatusRecovering))
-	s.epoch.Add(1)
+
+	// epoch = 启动时间戳（毫秒）
+	s.epoch.Store(uint64(time.Now().UnixMilli()))
 
 	// 初始化恢复状态
 	s.recovery = NewRecoveryState(cfg.Recovery.Timeout)
@@ -111,6 +114,13 @@ func (s *Server) Start() error {
 		s.recoveryMonitor()
 	}()
 
+	// 启动断连超时检查
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.disconnectTimeoutChecker()
+	}()
+
 	logger.Info("roomserver started")
 	return nil
 }
@@ -119,14 +129,6 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	logger.Info("stopping roomserver")
 	s.cancel()
-
-	// 关闭所有房间
-	s.roomsMu.Lock()
-	for _, room := range s.rooms {
-		room.Close()
-	}
-	s.roomsMu.Unlock()
-
 	s.wg.Wait()
 	logger.Info("roomserver stopped")
 }
@@ -141,104 +143,142 @@ func (s *Server) GetEpoch() uint64 {
 	return s.epoch.Load()
 }
 
-// GetOrCreateRoom 获取或创建房间
-func (s *Server) GetOrCreateRoom(roomID string) *Room {
-	s.roomsMu.Lock()
-	defer s.roomsMu.Unlock()
+// RoomService 获取房间服务
+func (s *Server) RoomService() *RoomService {
+	return s.roomSvc
+}
 
-	if room, ok := s.rooms[roomID]; ok {
-		return room
+// SessionService 获取会话服务
+func (s *Server) SessionService() *SessionService {
+	return s.sessionSvc
+}
+
+// JoinRoom 用户加入房间
+func (s *Server) JoinRoom(userID, roomID, gatewayID string) error {
+	// 检查并离开旧房间
+	oldRoomID := s.sessionSvc.GetUserRoom(userID)
+	if oldRoomID != "" && oldRoomID != roomID {
+		s.roomSvc.RemoveUser(oldRoomID, userID)
+		logger.Debug("user left old room",
+			zap.String("user_id", userID),
+			zap.String("old_room_id", oldRoomID),
+		)
 	}
 
-	room := NewRoom(roomID, s.cfg.Room.MsgChSize, s)
-	s.rooms[roomID] = room
-
-	// 启动房间 goroutine
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		room.Run(s.ctx)
-	}()
-
-	metrics.RoomserverRooms.Inc()
-	return room
-}
-
-// GetRoom 获取房间
-func (s *Server) GetRoom(roomID string) *Room {
-	s.roomsMu.RLock()
-	defer s.roomsMu.RUnlock()
-	return s.rooms[roomID]
-}
-
-// RemoveRoom 移除房间
-func (s *Server) RemoveRoom(roomID string) {
-	s.roomsMu.Lock()
-	room, ok := s.rooms[roomID]
-	if ok {
-		delete(s.rooms, roomID)
+	// 加入新房间
+	if err := s.roomSvc.AddUser(roomID, userID, gatewayID); err != nil {
+		return err
 	}
-	s.roomsMu.Unlock()
 
-	if ok {
-		room.Close()
-		metrics.RoomserverRooms.Dec()
+	// 更新会话
+	s.sessionSvc.UpdateSession(userID, roomID, gatewayID)
+
+	logger.Debug("user joined room",
+		zap.String("user_id", userID),
+		zap.String("room_id", roomID),
+		zap.String("gateway_id", gatewayID),
+	)
+
+	return nil
+}
+
+// LeaveRoom 用户离开房间
+func (s *Server) LeaveRoom(userID, roomID string) error {
+	s.roomSvc.RemoveUser(roomID, userID)
+	s.sessionSvc.DeleteSession(userID)
+
+	logger.Debug("user left room",
+		zap.String("user_id", userID),
+		zap.String("room_id", roomID),
+	)
+
+	return nil
+}
+
+// Resume 恢复连接
+func (s *Server) Resume(userID, roomID, gatewayID string) (int, string) {
+	session := s.sessionSvc.GetSession(userID)
+
+	// 用户不存在
+	if session == nil {
+		return protocol.ErrCodeUserNotInRoom, ""
 	}
+
+	// room_id 不匹配
+	if session.RoomID != roomID {
+		return protocol.ErrCodeRoomMismatch, session.RoomID
+	}
+
+	// 房间不存在
+	if !s.roomSvc.RoomExists(roomID) {
+		return protocol.ErrCodeRoomClosed, ""
+	}
+
+	// 更新 Gateway
+	s.roomSvc.UpdateUserGateway(roomID, userID, gatewayID)
+	s.sessionSvc.UpdateSession(userID, roomID, gatewayID)
+
+	logger.Debug("user resumed",
+		zap.String("user_id", userID),
+		zap.String("room_id", roomID),
+		zap.String("gateway_id", gatewayID),
+	)
+
+	return protocol.ErrCodeSuccess, ""
 }
 
-// GetUser 获取用户状态
-func (s *Server) GetUser(userID string) *UserState {
-	s.usersMu.RLock()
-	defer s.usersMu.RUnlock()
-	return s.users[userID]
-}
+// UserDisconnect 用户断连
+func (s *Server) UserDisconnect(userID, roomID string) {
+	s.roomSvc.SetUserDisconnected(roomID, userID)
+	s.sessionSvc.SetDisconnected(userID)
 
-// SetUser 设置用户状态
-func (s *Server) SetUser(state *UserState) {
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
-	s.users[state.UserID] = state
-}
-
-// RemoveUser 移除用户
-func (s *Server) RemoveUser(userID string) {
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
-	delete(s.users, userID)
+	logger.Debug("user disconnected",
+		zap.String("user_id", userID),
+		zap.String("room_id", roomID),
+	)
 }
 
 // GetGateway 获取 Gateway 连接
-func (s *Server) GetGateway(gatewayID string) *GatewayConn {
+func (s *Server) GetGatewayByID(gatewayID string) *GatewayConnection {
 	s.gatewaysMu.RLock()
 	defer s.gatewaysMu.RUnlock()
 	return s.gateways[gatewayID]
 }
 
-// AddGateway 添加 Gateway 连接
-func (s *Server) AddGateway(conn *GatewayConn) {
-	s.gatewaysMu.Lock()
-	defer s.gatewaysMu.Unlock()
-	s.gateways[conn.GatewayID] = conn
-	metrics.RoomserverGatewayConnections.Inc()
-}
+// NotifyRoomClose 通知房间关闭
+func (s *Server) NotifyRoomClose(roomID, reason string) {
+	gatewayIDs := s.roomSvc.GetRoomGatewayIDs(roomID)
 
-// RemoveGateway 移除 Gateway 连接
-func (s *Server) RemoveGateway(gatewayID string) {
-	s.gatewaysMu.Lock()
-	defer s.gatewaysMu.Unlock()
-	delete(s.gateways, gatewayID)
-	metrics.RoomserverGatewayConnections.Dec()
-}
-
-// BroadcastToGateways 广播消息到指定的 Gateways
-func (s *Server) BroadcastToGateways(gatewayIDs []string, msg *protocol.BroadcastMessage) {
 	s.gatewaysMu.RLock()
 	defer s.gatewaysMu.RUnlock()
 
+	msg := &protocol.RoomCloseNotify{
+		RoomID: roomID,
+		Reason: reason,
+	}
+	payload, _ := protocol.Encode(msg)
+
 	for _, gwID := range gatewayIDs {
 		if gw, ok := s.gateways[gwID]; ok {
-			gw.SendBroadcast(msg)
+			s.sendToGateway(gw, protocol.InternalMsgRoomClose, payload)
 		}
+	}
+}
+
+// NotifyEpochChange 通知所有 Gateway epoch 变更
+func (s *Server) NotifyEpochChange() {
+	s.gatewaysMu.RLock()
+	defer s.gatewaysMu.RUnlock()
+
+	notify := &protocol.EpochNotify{
+		ServerID:  s.cfg.Server.ID,
+		Epoch:     s.epoch.Load(),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	payload, _ := protocol.Encode(notify)
+
+	for _, gw := range s.gateways {
+		s.sendToGateway(gw, protocol.InternalMsgEpochNotify, payload)
 	}
 }
 
@@ -258,17 +298,41 @@ func (s *Server) recoveryMonitor() {
 	)
 }
 
-// NotifyEpochChange 通知所有 Gateway epoch 变更
-func (s *Server) NotifyEpochChange() {
-	s.gatewaysMu.RLock()
-	defer s.gatewaysMu.RUnlock()
+// disconnectTimeoutChecker 断连超时检查
+func (s *Server) disconnectTimeoutChecker() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-	notify := &protocol.EpochNotify{
-		Epoch:     s.epoch.Load(),
-		Timestamp: time.Now().UnixMilli(),
+	timeout := time.Duration(s.cfg.Disconnect.Timeout) * time.Second
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.checkDisconnectTimeout(timeout)
+		}
 	}
+}
 
-	for _, gw := range s.gateways {
-		gw.SendEpochNotify(notify)
+// checkDisconnectTimeout 检查断连超时的用户
+func (s *Server) checkDisconnectTimeout(timeout time.Duration) {
+	userIDs := s.sessionSvc.GetAllUserIDs()
+
+	for _, userID := range userIDs {
+		if s.sessionSvc.IsUserDisconnected(userID) {
+			duration := s.sessionSvc.GetDisconnectedDuration(userID)
+			if duration >= timeout {
+				session := s.sessionSvc.GetSession(userID)
+				if session != nil {
+					s.LeaveRoom(userID, session.RoomID)
+					logger.Info("user timed out",
+						zap.String("user_id", userID),
+						zap.String("room_id", session.RoomID),
+						zap.Duration("duration", duration),
+					)
+				}
+			}
+		}
 	}
 }

@@ -22,12 +22,12 @@ recovery:
 hashring:
   virtual_nodes: 150         # 虚拟节点数
 
-# Nacos 配置
+# Nacos 配置（留空禁用服务发现）
 nacos:
-  server_addr: "localhost:8848"
-  namespace: "imsys"
-  service_name: "imsys-roomserver"
-  gateway_service: "imsys-gateway"
+  server_addr: ""
+  namespace: ""
+  service_name: ""
+  gateway_service: ""
 
 # 日志配置
 log:
