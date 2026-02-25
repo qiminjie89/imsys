@@ -16,13 +16,13 @@ func (s *Server) runHTTPServer() {
 
 	// 推送接口（通过控制面发送，仅适用于小规模场景）
 	// 注意：大规模推送建议通过 Kafka 数据面（Python → Kafka → Gateway）
-	mux.HandleFunc("/api/v1/push/unicast", s.handleUnicast)
-	mux.HandleFunc("/api/v1/push/multicast", s.handleMulticast)
-	mux.HandleFunc("/api/v1/push/room_broadcast", s.handleRoomBroadcast)
-	mux.HandleFunc("/api/v1/push/global_broadcast", s.handleGlobalBroadcast)
+	mux.HandleFunc("/api/v1/push/unicast", s.handleUnicastHTTP)
+	mux.HandleFunc("/api/v1/push/multicast", s.handleMulticastHTTP)
+	mux.HandleFunc("/api/v1/push/room_broadcast", s.handleRoomBroadcastHTTP)
+	mux.HandleFunc("/api/v1/push/global_broadcast", s.handleGlobalBroadcastHTTP)
 
 	// 房间管理
-	mux.HandleFunc("/api/v1/room/close", s.handleRoomClose)
+	mux.HandleFunc("/api/v1/room/close", s.handleRoomCloseHTTP)
 
 	server := &http.Server{
 		Addr:    s.cfg.Server.HTTPAddr,
@@ -69,8 +69,8 @@ type RoomCloseRequest struct {
 	Reason string `json:"reason"`
 }
 
-// handleUnicast 处理单播
-func (s *Server) handleUnicast(w http.ResponseWriter, r *http.Request) {
+// handleUnicastHTTP 处理单播
+func (s *Server) handleUnicastHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -96,7 +96,7 @@ func (s *Server) handleUnicast(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 发送到 Gateway
-	gw := s.GetGateway(session.GatewayID)
+	gw := s.GetGatewayByID(session.GatewayID)
 	if gw == nil {
 		http.Error(w, "gateway not found", http.StatusNotFound)
 		return
@@ -106,15 +106,16 @@ func (s *Server) handleUnicast(w http.ResponseWriter, r *http.Request) {
 		UserID:  req.UserID,
 		Payload: req.Message,
 	}
-	gw.SendUnicast(msg)
+	payload, _ := protocol.Encode(msg)
+	s.sendToGateway(gw, protocol.InternalMsgUnicast, payload)
 
 	metrics.RoomserverBroadcasts.WithLabelValues("unicast").Inc()
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleMulticast 处理多播
-func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
+// handleMulticastHTTP 处理多播
+func (s *Server) handleMulticastHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -142,7 +143,7 @@ func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
 
 	// 发送到各个 Gateway
 	for gwID, userIDs := range gatewayUsers {
-		gw := s.GetGateway(gwID)
+		gw := s.GetGatewayByID(gwID)
 		if gw == nil {
 			continue
 		}
@@ -152,7 +153,8 @@ func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
 			UserIDs: userIDs,
 			Payload: req.Message,
 		}
-		gw.SendMulticast(msg)
+		payload, _ := protocol.Encode(msg)
+		s.sendToGateway(gw, protocol.InternalMsgMulticast, payload)
 	}
 
 	metrics.RoomserverBroadcasts.WithLabelValues("multicast").Inc()
@@ -160,9 +162,9 @@ func (s *Server) handleMulticast(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleRoomBroadcast 处理房间广播
+// handleRoomBroadcastHTTP 处理房间广播
 // 注意：大规模场景建议使用 Kafka 数据面（Python → Kafka → Gateway）
-func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRoomBroadcastHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -199,11 +201,12 @@ func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
 		RoomID:  req.RoomID,
 		Payload: req.Message,
 	}
+	payload, _ := protocol.Encode(msg)
 
 	s.gatewaysMu.RLock()
 	for _, gwID := range gatewayIDs {
 		if gw, ok := s.gateways[gwID]; ok {
-			gw.SendBroadcast(msg)
+			s.sendToGateway(gw, protocol.InternalMsgBroadcast, payload)
 		}
 	}
 	s.gatewaysMu.RUnlock()
@@ -213,9 +216,9 @@ func (s *Server) handleRoomBroadcast(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleGlobalBroadcast 处理全局广播
+// handleGlobalBroadcastHTTP 处理全局广播
 // 注意：大规模场景建议使用 Kafka 数据面（Python → Kafka → Gateway）
-func (s *Server) handleGlobalBroadcast(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGlobalBroadcastHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -247,11 +250,12 @@ func (s *Server) handleGlobalBroadcast(w http.ResponseWriter, r *http.Request) {
 	msg := &protocol.BroadcastMessage{
 		Payload: req.Message,
 	}
+	payload, _ := protocol.Encode(msg)
 
 	s.gatewaysMu.RLock()
 	for gwID := range allGatewayIDs {
 		if gw, ok := s.gateways[gwID]; ok {
-			gw.SendBroadcast(msg)
+			s.sendToGateway(gw, protocol.InternalMsgBroadcast, payload)
 		}
 	}
 	s.gatewaysMu.RUnlock()
@@ -261,8 +265,8 @@ func (s *Server) handleGlobalBroadcast(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// handleRoomClose 处理房间关闭
-func (s *Server) handleRoomClose(w http.ResponseWriter, r *http.Request) {
+// handleRoomCloseHTTP 处理房间关闭
+func (s *Server) handleRoomCloseHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -288,11 +292,12 @@ func (s *Server) handleRoomClose(w http.ResponseWriter, r *http.Request) {
 		RoomID: req.RoomID,
 		Reason: req.Reason,
 	}
+	payload, _ := protocol.Encode(closeMsg)
 
 	s.gatewaysMu.RLock()
 	for _, gwID := range gatewayIDs {
 		if gw, ok := s.gateways[gwID]; ok {
-			gw.SendRoomClose(closeMsg)
+			s.sendToGateway(gw, protocol.InternalMsgRoomClose, payload)
 		}
 	}
 	s.gatewaysMu.RUnlock()

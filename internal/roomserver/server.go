@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	pb "github.com/qiminjie89/imsys/api/proto/gen"
 	"github.com/qiminjie89/imsys/internal/protocol"
 	"github.com/qiminjie89/imsys/pkg/config"
 	"github.com/qiminjie89/imsys/pkg/logger"
@@ -18,7 +19,8 @@ import (
 // 仅负责控制面：房间管理、会话管理
 // 消息推送通过 Kafka 直达 Gateway（数据面）
 type Server struct {
-	cfg *config.RoomserverConfig
+	pb.UnimplementedRoomServerGatewayServer // gRPC forward compatibility
+	cfg                                     *config.RoomserverConfig
 
 	// 服务状态
 	status atomic.Int32  // ServerStatus

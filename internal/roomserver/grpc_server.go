@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -36,11 +37,15 @@ func (s *Server) runGRPCServer() {
 
 	grpcServer := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle:     0, // 无空闲超时
-			MaxConnectionAge:      0, // 无连接年龄限制
-			MaxConnectionAgeGrace: 0,
-			Time:                  10,
-			Timeout:               3,
+			MaxConnectionIdle:     0,                 // 无空闲超时
+			MaxConnectionAge:      0,                 // 无连接年龄限制
+			MaxConnectionAgeGrace: 0,                 // 无优雅关闭期
+			Time:                  10 * time.Second,  // ping 间隔
+			Timeout:               3 * time.Second,   // ping 超时
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second, // 允许客户端最小 ping 间隔
+			PermitWithoutStream: true,            // 允许无 stream 时 ping
 		}),
 	)
 
@@ -233,10 +238,7 @@ func (s *Server) handleDisconnect(conn *GatewayConnection, payload []byte) {
 		zap.String("room_id", notify.RoomID),
 	)
 
-	room := s.getRoom(notify.RoomID)
-	if room != nil {
-		room.OnDisconnect(notify.UserID)
-	}
+	s.UserDisconnect(notify.UserID, notify.RoomID)
 }
 
 // handleBatchReSync 处理批量重同步
@@ -253,9 +255,11 @@ func (s *Server) handleBatchReSync(conn *GatewayConnection, payload []byte) {
 	)
 
 	for _, pair := range req.Users {
-		room := s.getOrCreateRoom(pair.RoomID)
-		room.AddMember(pair.UserID, req.GatewayID)
+		s.JoinRoom(pair.UserID, pair.RoomID, req.GatewayID)
 	}
+
+	// 更新恢复状态
+	s.recovery.OnUsersReceived(len(req.Users))
 }
 
 // handleReSyncComplete 处理重同步完成
@@ -270,6 +274,9 @@ func (s *Server) handleReSyncComplete(conn *GatewayConnection, payload []byte) {
 		zap.String("gateway_id", req.GatewayID),
 		zap.Int("total_users", req.TotalUsers),
 	)
+
+	// 标记该 Gateway 完成重同步
+	s.recovery.OnGatewayComplete()
 }
 
 // sendJoinRoomAck 发送 JoinRoom ACK
@@ -290,7 +297,7 @@ func (s *Server) sendJoinRoomAck(conn *GatewayConnection, userID, roomID string,
 func (s *Server) sendEpochNotify(conn *GatewayConnection) {
 	notify := &protocol.EpochNotify{
 		ServerID: s.cfg.Server.ID,
-		Epoch:    s.epoch,
+		Epoch:    s.epoch.Load(),
 	}
 
 	payload, _ := protocol.Encode(notify)
