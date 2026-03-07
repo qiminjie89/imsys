@@ -160,36 +160,212 @@
 
 ```go
 type Gateway struct {
-    gatewayID string  // 配置项：gateway.id
+    gatewayID string
     ip        string
     port      int
 
-    connections map[string]*Connection  // user_id → connection（不支持多端）
-    distributors []*Distributor         // 按 hash(user_id) 分配连接
-    localRooms map[string]map[string]bool  // room_id → Set<user_id>
-    localUsers map[string]bool             // user_id → true
+    // 连接管理
+    connections  map[string]*Connection   // user_id → connection
+    distributors []*Distributor           // 按 hash(user_id) 分配连接
 
-    roomserverStreams map[string]*grpc.ClientStream  // roomserver_id → stream
-    knownEpochs map[string]uint64  // roomserver_id → epoch
-    hashRing *ConsistentHash       // 路由预测
+    // 本地状态（用于消息过滤和扇出）
+    localRooms map[string]map[string]bool // room_id → Set<user_id>
+    localUsers map[string]bool            // user_id → true
 
+    // 消息补漏缓存
+    roomBuffers map[string]*RingBuffer    // room_id → RingBuffer
+
+    // Roomserver 连接
+    roomserverStreams map[string]*grpc.ClientStream
+    knownEpochs       map[string]uint64
+    hashRing          *ConsistentHash
+
+    // Kafka
     kafkaConsumer *kafka.Consumer  // consumer_group = gateway_id
-    userLocks sync.Map             // user_id → *sync.Mutex（请求串行化）
 
+    // 状态
     status        GatewayStatus    // NORMAL / DEGRADED
-    pendingLeaves []PendingRequest // DEGRADED 期间待补偿
+    pendingLeaves []PendingRequest
 }
 
 type Connection struct {
     UserID      string
     WSConn      *websocket.Conn
-    sendCh      chan []byte
-    JoinState   JoinState  // INIT → PENDING → CONFIRMED
+    criticalCh  chan []byte       // Critical 消息队列（容量小，优先级高）
+    normalCh    chan []byte       // 普通消息队列（容量大）
+    JoinState   JoinState
     RoomID      string
-    TokenExpiry time.Time
     distributor *Distributor
     health      ConnHealth
 }
+
+type RingBuffer struct {
+    capacity int                  // 1000
+    messages []BufferedMessage    // 环形数组
+    head     int
+    tail     int
+    mu       sync.RWMutex
+}
+
+type BufferedMessage struct {
+    Seq       uint64
+    Payload   []byte
+    Timestamp time.Time
+}
+```
+
+#### 消息推送完整流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Gateway 消息推送流程                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Kafka Consumer (单 goroutine)                                    │   │
+│  │                                                                      │   │
+│  │  for msg := range consumer.Messages() {                             │   │
+│  │      // 快速过滤：只读 Header，不反序列化 Payload                      │   │
+│  │      roomID := msg.Headers.Get("room_id")                           │   │
+│  │      if !localRooms.Has(roomID) {                                   │   │
+│  │          continue  // 本 Gateway 无该房间用户，跳过                    │   │
+│  │      }                                                              │   │
+│  │      handleMessage(msg)                                             │   │
+│  │  }                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     │                                       │
+│                                     ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  2. handleMessage (消息处理)                                         │   │
+│  │                                                                      │   │
+│  │  func handleMessage(msg) {                                          │   │
+│  │      // Step 1: 完整反序列化                                          │   │
+│  │      payload := msgpack.Unmarshal(msg.Value)                        │   │
+│  │                                                                      │   │
+│  │      // Step 2: 先写 RingBuffer（保证可补漏）                          │   │
+│  │      roomBuffers[roomID].Write(payload.Seq, msg.Value)              │   │
+│  │                                                                      │   │
+│  │      // Step 3: 获取房间内用户列表                                     │   │
+│  │      users := localRooms[roomID]                                    │   │
+│  │                                                                      │   │
+│  │      // Step 4: 按用户分发到对应 Distributor                          │   │
+│  │      for userID := range users {                                    │   │
+│  │          dist := distributors[hash(userID) % N]                     │   │
+│  │          dist.inputQueue <- {userID, payload}  // 非阻塞             │   │
+│  │      }                                                              │   │
+│  │  }                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     │                                       │
+│                    ┌────────────────┼────────────────┐                     │
+│                    ▼                ▼                ▼                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  3. Distributor (N 个 goroutine，N = CPU × 2)                        │   │
+│  │                                                                      │   │
+│  │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                │   │
+│  │  │Distributor-1│   │Distributor-2│   │Distributor-N│                │   │
+│  │  │ inputQueue  │   │ inputQueue  │   │ inputQueue  │                │   │
+│  │  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘                │   │
+│  │         │                 │                 │                        │   │
+│  │         ▼                 ▼                 ▼                        │   │
+│  │  for item := range inputQueue {                                     │   │
+│  │      conn := connections[item.userID]                               │   │
+│  │      if item.priority == "critical" {                               │   │
+│  │          // Critical: 带超时的阻塞写入                                 │   │
+│  │          select {                                                   │   │
+│  │          case conn.criticalCh <- item.payload:                      │   │
+│  │          case <-time.After(100ms): conn.markUnhealthy()             │   │
+│  │          }                                                          │   │
+│  │      } else {                                                       │   │
+│  │          // Normal: 非阻塞写入                                        │   │
+│  │          select {                                                   │   │
+│  │          case conn.normalCh <- item.payload:                        │   │
+│  │          default: conn.dropCount++                                  │   │
+│  │          }                                                          │   │
+│  │      }                                                              │   │
+│  │  }                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     │                                       │
+│                    ┌────────────────┼────────────────┐                     │
+│                    ▼                ▼                ▼                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  4. Connection writeLoop (每连接 1 个 goroutine)                      │   │
+│  │                                                                      │   │
+│  │  ┌──────────┐    ┌──────────┐    ┌──────────┐                       │   │
+│  │  │ Conn-1   │    │ Conn-2   │    │ Conn-M   │                       │   │
+│  │  │criticalCh│    │criticalCh│    │criticalCh│   (容量: 64)          │   │
+│  │  │ normalCh │    │ normalCh │    │ normalCh │   (容量: 1024)        │   │
+│  │  └────┬─────┘    └────┬─────┘    └────┬─────┘                       │   │
+│  │       │               │               │                              │   │
+│  │       ▼               ▼               ▼                              │   │
+│  │  writeLoop:                                                          │   │
+│  │    // 优先消费 criticalCh                                             │   │
+│  │    select {                                                          │   │
+│  │    case msg := <-criticalCh: writeWithRetry(msg)                    │   │
+│  │    default:                                                          │   │
+│  │    }                                                                │   │
+│  │    // 再消费 normalCh                                                 │   │
+│  │    select {                                                          │   │
+│  │    case msg := <-criticalCh: writeWithRetry(msg)                    │   │
+│  │    case msg := <-normalCh:   batchAndWrite(msg)                     │   │
+│  │    case <-ticker.C:          flushBatch()                           │   │
+│  │    }                                                                │   │
+│  │       │               │               │                              │   │
+│  │       ▼               ▼               ▼                              │   │
+│  │  WebSocket-1     WebSocket-2     WebSocket-M                        │   │
+│  │   (阻塞写)        (阻塞写)        (阻塞写)                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 消息补漏流程 (PullRequest)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  客户端检测到 Seq Gap                                                        │
+│                                                                             │
+│  收到消息 seq=105，但 lastSeq=100                                            │
+│       │                                                                     │
+│       ▼                                                                     │
+│  发送 PullRequest{room_id, from_seq:101, to_seq:104}                        │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Gateway 处理 PullRequest                                            │   │
+│  │                                                                      │   │
+│  │  func handlePullRequest(req) {                                      │   │
+│  │      buffer := roomBuffers[req.RoomID]                              │   │
+│  │      messages := buffer.GetRange(req.FromSeq, req.ToSeq)            │   │
+│  │                                                                      │   │
+│  │      if len(messages) < expected {                                  │   │
+│  │          // 消息太旧，已被覆盖                                         │   │
+│  │          return PullResponse{status: "gap_too_large"}               │   │
+│  │      }                                                              │   │
+│  │                                                                      │   │
+│  │      return PullResponse{messages: messages}                        │   │
+│  │  }                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                     │
+│       ▼                                                                     │
+│  客户端收到 PullResponse，填补 seq 101-104 的消息                             │
+│  更新 lastSeq = 105                                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键设计要点
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  设计要点                              │  说明                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1. Header 过滤在前                    │  减少 90% 无效反序列化              │
+│  2. RingBuffer 写入在 Fanout 之前       │  保证丢弃的消息仍可补漏              │
+│  3. Distributor 非阻塞写 sendCh        │  慢连接不阻塞其他连接                │
+│  4. Critical 双队列 + 优先消费          │  重要消息优先触达                   │
+│  5. writeLoop 批量写入                 │  减少 WebSocket 写次数              │
+│  6. 每连接独立 goroutine               │  慢连接隔离                         │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### JoinRoom 状态机
@@ -398,21 +574,94 @@ ErrCodeServiceRecovering = 5001
 
 ### 4.4 Kafka 消息格式
 
-```json
+```
 // Topic: im_msg_broadcast
+// 压缩: lz4（生产端配置）
+
+Headers:
+  scope: "room"              // 用于快速过滤，无需反序列化 payload
+  room_id: "xxx"             // scope=room 时
+  user_id: "yyy"             // scope=user 时
+  priority: "normal"         // critical/high/normal/low
+
+Payload (msgpack):
 {
-    "scope": "room",           // room | user | platform | multicast
+    "scope": "room",
     "room_id": "xxx",
     "user_id": "yyy",          // scope=user 时
     "user_ids": ["a", "b"],    // scope=multicast 时
     "seq": 12345,
-    "priority": "normal",      // critical/high/normal/low
+    "priority": "normal",
     "message": { ... }
 }
 
 // Partition Key: room_id（房间广播）或 user_id（单播）
 // 每个 Gateway 独立 consumer_group，消费全部 partition，本地过滤
 ```
+
+### 4.5 Kafka 消费优化
+
+#### 问题背景
+
+```
+每个 Gateway 独立消费全部 Kafka 分区，大部分消息被过滤：
+  - 10 个 Gateway，每条消息被消费 10 次
+  - 单 Gateway 可能只有 10% 的房间用户
+  - 90% 的消息反序列化后被丢弃 → CPU 浪费
+```
+
+#### 优化方案
+
+**1. Kafka Header + 延迟反序列化**
+
+```go
+// Python 发送时：路由信息放到 Kafka Header
+producer.send(
+    topic="im_msg_broadcast",
+    key=room_id,
+    headers={
+        "scope": scope,
+        "room_id": room_id,    // 用于快速过滤
+        "priority": priority,
+    },
+    value=msgpack.dumps(payload),
+)
+
+// Gateway 消费时：先检查 Header，匹配后才反序列化
+func (g *Gateway) consumeMessage(msg *kafka.Message) {
+    // Step 1: 快速过滤（只读 header，不反序列化 payload）
+    scope := msg.Headers.Get("scope")
+    roomID := msg.Headers.Get("room_id")
+
+    if scope == "room" && !g.localRooms.Has(roomID) {
+        return  // 快速跳过，CPU 开销极小
+    }
+
+    // Step 2: 匹配后才反序列化完整 payload
+    var payload PushPayload
+    msgpack.Unmarshal(msg.Value, &payload)
+    g.distribute(roomID, payload)
+}
+```
+
+**2. Kafka lz4 压缩**
+
+```yaml
+# Kafka Producer 配置
+compression.type: lz4    # 压缩比 2-3x，解压速度 4GB/s
+
+# 效果：
+#   - 网络带宽下降 60%
+#   - CPU 开销可忽略（lz4 解压极快）
+```
+
+#### 效果评估
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| 反序列化次数 | 100% | 10%（仅匹配消息） |
+| CPU 用于过滤 | 高 | 低（Header 解析成本 ~5%） |
+| 网络带宽 | 100% | 40%（lz4 压缩） |
 
 ---
 
@@ -494,26 +743,18 @@ Gateway 批量清理 localRooms[room_id]，通知客户端
   - 连续写超时 > 10 次（单次超时 500ms）
 ```
 
-#### Distributor 分片架构
+#### Distributor 参数配置
 
-```
-               Kafka 消息
-                   ↓
-              Dispatcher
-                   ↓
-    ┌──────────────┼──────────────┐
-    ↓              ↓              ↓
-Distributor-1  Distributor-2  Distributor-N
-(inputQueue)   (inputQueue)   (inputQueue)
-    ↓              ↓              ↓
-  fanout (非阻塞投递到 conn.sendCh)
-    ↓
-conn.writeLoop (独立 goroutine，批量写)
-
-设计要点：
-  - Distributor：CPU 密集，不阻塞
-  - writeLoop：IO 密集，独立隔离慢连接
-  - select + default：队列满立即放弃，保护快连接
+```go
+const (
+    DistributorCount      = runtime.NumCPU() * 2  // 分片数
+    DistributorQueueSize  = 10000                 // inputQueue 容量
+    ConnCriticalChSize    = 64                    // Critical 队列容量
+    ConnNormalChSize      = 1024                  // Normal 队列容量
+    RingBufferCapacity    = 1000                  // 每房间缓存消息数
+    BatchInterval         = 10 * time.Millisecond // 批量发送间隔
+    BatchMaxSize          = 10                    // 单批最大消息数
+)
 ```
 
 ### 5.4 心跳弱自愈
@@ -533,56 +774,90 @@ Client ──Heartbeat{room_id}──> Gateway
   - not_in_room: Join(client_room_id)
 ```
 
+**BatchReSyncAck 主动通知**：
+
+当 BatchReSyncAck 返回 `rejected` 或 `corrected` 的用户时，Gateway 主动推送通知给受影响的客户端，而不是等待下次心跳：
+
+```
+BatchReSyncAck 返回
+    │
+    ├── rejected 用户列表
+    │       │
+    │       └── 向客户端推送 RoomMismatch{状态: not_in_room}
+    │
+    └── corrected 用户列表
+            │
+            └── 向客户端推送 RoomMismatch{状态: wrong_room, correct_room_id}
+```
+
+客户端收到通知后，按心跳弱自愈的逻辑处理。
+
 ### 5.5 消息可靠性保障（Seq + RingBuffer + 客户端补漏）
 
-#### 问题背景
+#### 设计原理
 
 ```
-Python → Kafka → Gateway → Distributor → Connection → Client
-                              ↓
-                    inputQueue 满时消息丢弃
-                              ↓
-                    Python 无感知，无法重试
-```
-
 实时推送是 Fire-and-Forget，慢连接导致的消息丢失无法避免。
-
-#### 解决方案：分层保障
-
+解决方案：消息先存 RingBuffer，再 Fanout，客户端通过 Seq 检测 Gap 并补漏。
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 1: 实时推送（Best-Effort）                            │
-├─────────────────────────────────────────────────────────────┤
-│  Python → Kafka → Gateway → Client                          │
-│  - 每条消息带 seq（room 级别单调递增）                         │
-│  - inputQueue 满就丢，接受这个事实                            │
-└─────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 2: 消息暂存（Gateway RingBuffer）                     │
-├─────────────────────────────────────────────────────────────┤
-│  Gateway 维护 per-room 环形缓冲区：                           │
-│                                                             │
-│  roomBuffers[room_id] = RingBuffer{                        │
-│      capacity: 1000,  // 最近 1000 条                        │
-│      messages: [{seq, payload, timestamp}, ...]             │
-│  }                                                          │
-│                                                             │
-│  消息推送时同时写入 buffer（O(1) 操作，不阻塞）                 │
-└─────────────────────────────────────────────────────────────┘
+#### 三层保障
 
-┌─────────────────────────────────────────────────────────────┐
-│  Layer 3: 客户端补漏（Seq Gap Detection）                    │
-├─────────────────────────────────────────────────────────────┤
-│  Client 维护 lastSeq[room_id]                               │
-│                                                             │
-│  收到消息时检测 gap：                                         │
-│    if msg.seq > lastSeq + 1:                               │
-│        send(PullRequest{room_id, from_seq: lastSeq + 1})   │
-│                                                             │
-│  Gateway 收到 PullRequest：                                  │
-│    从 roomBuffers[room_id] 返回 seq 范围内的消息              │
-└─────────────────────────────────────────────────────────────┘
+| 层次 | 机制 | 说明 |
+|------|------|------|
+| Layer 1 | 实时推送 | Best-Effort，sendCh 满则丢弃 |
+| Layer 2 | RingBuffer | 消息先存后推，保证可补漏 |
+| Layer 3 | 客户端补漏 | 检测 Seq Gap，发送 PullRequest |
+
+#### 关键实现顺序
+
+```go
+func (g *Gateway) handleMessage(msg *Message) {
+    // ⚠️ 顺序很重要：先存后推
+
+    // Step 1: 写入 RingBuffer（保证丢弃的消息仍可补漏）
+    g.roomBuffers[msg.RoomID].Write(msg.Seq, msg.Payload)
+
+    // Step 2: Fanout 到连接（可能丢弃）
+    for userID := range g.localRooms[msg.RoomID] {
+        dist := g.getDistributor(userID)
+        select {
+        case dist.inputQueue <- msg:
+        default:
+            // 丢弃，但 RingBuffer 里还有
+        }
+    }
+}
+```
+
+#### RingBuffer 设计
+
+```go
+// 环形缓冲区，O(1) 写入，自动覆盖旧消息
+type RingBuffer struct {
+    capacity int               // 1000 条/房间
+    messages []BufferedMessage
+    seqIndex map[uint64]int    // seq → 数组下标（快速查找）
+}
+
+// 写入：永不阻塞
+func (r *RingBuffer) Write(seq uint64, payload []byte) {
+    idx := r.tail % r.capacity
+    r.messages[idx] = BufferedMessage{Seq: seq, Payload: payload}
+    r.seqIndex[seq] = idx
+    r.tail++
+
+    // 清理被覆盖的旧 seq
+    if r.tail > r.capacity {
+        oldSeq := r.messages[(r.tail-r.capacity-1) % r.capacity].Seq
+        delete(r.seqIndex, oldSeq)
+    }
+}
+
+// 读取：用于 PullRequest
+func (r *RingBuffer) GetRange(fromSeq, toSeq uint64) []BufferedMessage {
+    // 返回 [fromSeq, toSeq] 范围内的消息
+}
 ```
 
 #### 协议扩展
@@ -642,35 +917,118 @@ PullResponse 格式：
 
 ### 6.2 BatchReSync（Roomserver 崩溃恢复）
 
-```
-触发：Roomserver 进程崩溃/重启
-影响：内存数据丢失，Client ↔ Gateway 不受影响
-客户端感知：无（Gateway 处理）
+#### Epoch 机制
 
-流程：
-  Roomserver 启动，epoch=当前时间戳，进入 RECOVERY MODE
-      ↓
-  广播 EpochNotify 给所有 Gateway
-      ↓
-  Gateway 检测 epoch 变化，渐进式上报 BatchReSync
-    - 每批 1000 用户，间隔 10ms
-    - 只上报 CONFIRMED 状态
-      ↓
-  Roomserver 合并状态（最新 Gateway 为准）
-      ↓
-  退出条件：超时(30s) 或 所有 Gateway 完成上报
-      ↓
-  进入 SERVING，处理缓冲请求
+```
+作用：标识 Roomserver 启动周期，用于检测 Gateway 是否错过重启
+
+Roomserver 重启时：
+  epoch = time.Now().UnixMilli()  // 新时间戳
+
+Gateway 连接时：
+  发送 GatewayInfo{knownEpoch}
+  Roomserver 比较 epoch，不同则请求 BatchReSync
+```
+
+#### 恢复流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  场景 1：Roomserver 正常重启                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Roomserver 重启                                                            │
+│      │                                                                      │
+│      ├── epoch = 当前时间戳                                                  │
+│      ├── 进入 RECOVERY MODE                                                 │
+│      │                                                                      │
+│      ▼                                                                      │
+│  向所有已连接 Gateway 发送 BatchReSyncRequest{epoch}                         │
+│      │                                                                      │
+│      ▼                                                                      │
+│  Gateway 收到请求，主动发起 BatchReSync（阻塞 RPC）                           │
+│      │                                                                      │
+│      ├── 分批上报：每批 1000 用户，间隔 10ms                                  │
+│      ├── 携带信息：userID, roomID, gatewayID, lastActiveAt                  │
+│      │                                                                      │
+│      ▼                                                                      │
+│  Roomserver 处理数据                                                        │
+│      │                                                                      │
+│      ├── 冲突解决：同一用户多 Gateway → 以 lastActiveAt 最新为准              │
+│      ├── 使用 Roomserver 收到时间，避免时钟偏差                               │
+│      │                                                                      │
+│      ▼                                                                      │
+│  返回 BatchReSyncAck{confirmed, rejected, corrected}                        │
+│      │                                                                      │
+│      ├── confirmed：确认一致                                                │
+│      ├── rejected：用户不在该 Gateway（Gateway 清除本地）                    │
+│      ├── corrected：用户在不同房间（Gateway 更新本地）                        │
+│      │                                                                      │
+│      ▼                                                                      │
+│  Gateway 根据 ACK 刷新本地缓存                                               │
+│      │                                                                      │
+│      ▼                                                                      │
+│  所有 Gateway 完成（或超时 30s）→ 退出 RECOVERY MODE → SERVING               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  场景 2：Gateway 因分区错过 BatchReSyncRequest                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  分区期间 Roomserver 重启，epoch 变更                                        │
+│      │                                                                      │
+│      ▼                                                                      │
+│  分区恢复，Gateway 重新连接                                                  │
+│      │                                                                      │
+│      ├── Gateway 发送 GatewayInfo{knownEpoch=旧值}                          │
+│      │                                                                      │
+│      ▼                                                                      │
+│  Roomserver 检测 epoch 不匹配                                               │
+│      │                                                                      │
+│      ├── 发送 BatchReSyncRequest{epoch=新值}                                │
+│      │                                                                      │
+│      ▼                                                                      │
+│  Gateway 发起 BatchReSync（同场景 1）                                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### pendingLeaves 过期处理
+
+```go
+type PendingLeave struct {
+    UserID    string
+    RoomID    string
+    CreatedAt time.Time
+    ExpireAt  time.Time  // TTL = 5 分钟
+}
+
+// 分区恢复后处理
+func (g *Gateway) processPendingLeaves() {
+    now := time.Now()
+    for _, pl := range g.pendingLeaves {
+        if now.After(pl.ExpireAt) {
+            continue  // 过期丢弃
+        }
+        g.sendLeaveRequest(pl)  // Roomserver 会校验用户是否仍在该 Gateway
+    }
+    g.pendingLeaves = nil
+}
 ```
 
 ### 6.3 Gateway 与 Roomserver 网络分区
 
 ```
 核心原则：
-  - 踢用户没有意义（连不上 Roomserver，重连也无法 JoinRoom）
   - 数据面（Kafka）独立，消息推送不受影响
-  - 保证数据面可用，控制面优雅降级
+  - 控制面优雅降级，分区恢复后自动修复
+  - Roomserver 是权威数据源
+```
 
+#### 分区处理流程
+
+```
 ┌─────────────────────────────────────────────────────────────────┐
 │  阶段 1：短期断连（< 30s）                                         │
 ├─────────────────────────────────────────────────────────────────┤
@@ -683,16 +1041,94 @@ PullResponse 格式：
 │  阶段 2：长期断连（>= 30s）                                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  Gateway 状态：DEGRADED                                          │
-│  /health 返回 degraded（ELB 不分配新连接）                         │
+│  /health 返回 degraded（Dispatcher 不分配新连接）                  │
 │  数据面继续正常                                                   │
 │  控制面降级：                                                     │
 │    - JoinRoom：返回 503                                          │
-│    - LeaveRoom：本地执行，记录 pendingLeaves 待补偿                │
+│    - LeaveRoom：本地执行，记录 pendingLeaves（TTL 5分钟）          │
 │    - Resume：检查 localRooms，有则成功，无则 503                   │
 │  触发告警，运维介入                                                │
 └─────────────────────────────────────────────────────────────────┘
+```
 
-恢复后：BatchReSync + 处理 pendingLeaves + 恢复 NORMAL
+#### 分区恢复流程
+
+```
+分区恢复
+    │
+    ├── Gateway 重新连接 Roomserver
+    │
+    ├── 发送 GatewayInfo{knownEpoch}
+    │       │
+    │       ├── epoch 相同 → 无需 BatchReSync
+    │       │       │
+    │       │       └── 处理 pendingLeaves
+    │       │
+    │       └── epoch 不同 → Roomserver 请求 BatchReSync
+    │               │
+    │               └── Gateway 发起 BatchReSync
+    │                       │
+    │                       └── 根据 ACK 刷新本地数据
+    │
+    └── Gateway 恢复 NORMAL 状态
+```
+
+#### 用户操作场景
+
+```
+场景 A：用户无操作
+  → 消息收发正常（数据面独立）
+
+场景 B：用户 Leave 房间
+  → Leave 失败 → 本地 pendingLeave → 返回客户端成功
+  → 分区恢复 → 发送 Leave → Roomserver 处理
+
+场景 C：用户 Leave 后 Join 其他房间
+  → Join 失败（503）→ 重试 3 次
+  → 客户端获取新 Gateway（如 Gateway2）
+  → 断开 Gateway1（Gateway1 清除本地用户数据）
+  → 连接 Gateway2 → Join 成功
+
+场景 D：场景 C 后分区恢复
+  → Gateway1 处理 pendingLeave
+  → Roomserver 发现用户已在 Gateway2 → 忽略
+```
+
+#### Gateway 断连处理
+
+```
+当 Gateway 与 Roomserver 断连时，Roomserver 不立即清除该 Gateway 上的用户状态：
+
+Roomserver 检测到 Gateway 断连
+    │
+    └── 启动 5 分钟延迟计时器
+            │
+            ├── 5 分钟内 Gateway 重连 → 取消计时器，继续服务
+            │
+            └── 5 分钟后 Gateway 仍未重连
+                    │
+                    └── 标记该 Gateway 上所有用户为 disconnected
+                        （触发 60s 用户断线超时计时器）
+```
+
+**设计理由**：
+- 短暂网络抖动不应触发用户状态变更
+- 5 分钟足够覆盖大多数网络恢复场景
+- 与 pendingLeaves TTL（5 分钟）保持一致
+- 真正长期断连的情况，由 BatchReSync 机制处理
+
+```go
+func (r *Roomserver) onGatewayDisconnect(gatewayID string) {
+    time.AfterFunc(5*time.Minute, func() {
+        if r.isGatewayConnected(gatewayID) {
+            return  // 已重连，无需处理
+        }
+        users := r.getUsersByGateway(gatewayID)
+        for _, user := range users {
+            r.markDisconnected(user.UserID)
+        }
+    })
+}
 ```
 
 ---
@@ -867,12 +1303,16 @@ func selectGateway(clientIP string) *Gateway {
 
 ### 队列/容量参数
 
-| 参数 | 值 |
-|------|-----|
-| BatchReSync 批次 | 1000 用户，间隔 10ms |
-| Distributor 分片数 | CPU 核数 × 2 |
-| Conn SendCh | 1024 |
-| 批量发送 | 间隔 10ms，上限 10 条 |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| Distributor 分片数 | CPU × 2 | 并行 fanout |
+| Distributor inputQueue | 10000 | 消息入队缓冲 |
+| Conn criticalCh | 64 | Critical 消息队列 |
+| Conn normalCh | 1024 | 普通消息队列 |
+| RingBuffer 容量 | 1000 条/房间 | 消息补漏缓存 |
+| 批量发送间隔 | 10ms | writeLoop 批量写 |
+| 批量发送上限 | 10 条 | 单批最大消息数 |
+| BatchReSync 批次 | 1000 用户，间隔 10ms | Roomserver 恢复 |
 
 ### 连接保护参数
 
@@ -893,16 +1333,19 @@ func selectGateway(clientIP string) *Gateway {
 - JoinRoom / LeaveRoom / Resume
 - 房间广播、单播、多播
 - ACK 驱动状态更新
+- **Distributor 分片 + 双队列（Critical/Normal）**
+- **RingBuffer + 客户端 PullRequest 补漏**
 - 消息分级、背压、连接保护
 - 心跳弱自愈
 - Roomserver 崩溃恢复（BatchReSync）
 - 基本监控指标（Prometheus）
+- **Kafka Header + 延迟反序列化**（消费优化）
+- **Kafka lz4 压缩**（带宽优化）
 
 **延后：**
-- 消息压缩（带宽瓶颈时）
 - 扩缩容逻辑（用户增长时）
 - 消息重放（有明确需求时）
 - QUIC 传输（移动网络优化需求时）
-- Kafka 消费优化/Dispatcher 层（CPU 占比超 30%）
+- Dispatcher 层（Gateway > 50 且 Kafka CPU > 30% 时）
 - 大房间拆分（需要 50K 用户/房间时）
 
