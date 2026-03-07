@@ -126,14 +126,23 @@ Roomserver 重启 → 等待 Gateway BatchReSync → 恢复服务
 
 ---
 
-## 待讨论事项
+### B. ~~客户端重连策略~~ ✅ 已确定方案
 
-### B. 客户端重连策略
-- 断连后的重试策略
-- Resume 失败后的降级策略
-- 网络切换的处理
+**已采用方案**（见技术方案 7.3 节）：
+
+1. **Gateway 断连**：立即重连当前 Gateway → Resume → 根据错误码决定下一步
+   - 410（用户过期）→ 直接 JoinRoom
+   - 503（服务不可用）→ 请求 Dispatcher 换 Gateway
+
+2. **JoinRoom 失败 × 3**：请求 Dispatcher 获取可用 Gateway 列表
+   - 列表非空 → 换 Gateway
+   - 列表为空（所有 Gateway DEGRADED）→ 指数退避重试
+
+3. **退避策略**：1s → 2s → 4s → 8s → max 30s（±20% jitter）
+
+4. **Dispatcher 列表刷新**：需要换 Gateway 时 / TTL 5分钟过期 / 熔断恢复后
 
 ---
 
 *创建时间: 2026-03-06*
-*最后更新: 2026-03-06*
+*最后更新: 2026-03-08*
